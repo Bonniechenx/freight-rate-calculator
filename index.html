@@ -322,6 +322,46 @@ function sheetToRows(ws){
   const headers = rows.length ? Object.keys(rows[0]) : (XLSX.utils.sheet_to_json(ws,{header:1})[0]||[]);
   return {headers, rows};
 }
+function sheetToRowsMultiHeader(ws){
+  const aoa = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+  if(!aoa.length) return {headers:[], rows:[]};
+  const width = Math.max((aoa[0]||[]).length, (aoa[1]||[]).length, 1);
+  const norm = row => { const a=(row||[]).slice(0,width); while(a.length<width) a.push(''); return a.map(c=> typeof c==='string' ? c.trim() : c); };
+  const h1 = norm(aoa[0]);
+  const h2 = norm(aoa[1]);
+  const headers = [];
+  for(let i=0;i<width;i++){
+    const a = (h1[i]!=='' && h1[i]!=null) ? String(h1[i]) : '';
+    const b = (h2[i]!=='' && h2[i]!=null) ? String(h2[i]) : '';
+    let name = [a,b].filter(Boolean).join('/');
+    if(!name) name = `列${i+1}`;
+    let base = name, k = 1;
+    while(headers.includes(name)){ name = base+'_'+(++k); }
+    headers.push(name);
+  }
+  const h1Key = JSON.stringify(h1), h2Key = JSON.stringify(h2);
+  const rows = [];
+  for(let ri=2; ri<aoa.length; ri++){
+    const r = norm(aoa[ri]);
+    if(r.every(c=> c===''||c==null)) continue;
+    const key = JSON.stringify(r);
+    if(key===h1Key || key===h2Key) continue;
+    const obj = {};
+    headers.forEach((h,i)=> obj[h]=r[i]);
+    rows.push(obj);
+  }
+  return {headers, rows};
+}
+function destMatches(cellRaw, targetNorm){
+  const raw = String(cellRaw==null?'':cellRaw).trim();
+  if(!raw || !targetNorm) return false;
+  if(raw.includes('全部')) return true;
+  const exclude = raw.includes('排除');
+  const body = raw.replace(/[【】]/g,'').replace(/排除/g,'').trim();
+  const tokens = body.split(/[\s,,、\/]+/).map(normalizeRegion).filter(Boolean);
+  const hit = tokens.some(t=> t===targetNorm || t.includes(targetNorm) || targetNorm.includes(t));
+  return exclude ? !hit : hit;
+}
 
 /* ---------------- sample data ---------------- */
 const SAMPLE_WAYBILL_HEADERS = ["运单号","收件省份","收件城市","收件区县","实际重量(kg)","长(cm)","宽(cm)","高(cm)","发货日期","产品类型"];
@@ -375,7 +415,9 @@ function emptyState(){
     isSample:false,
     waybill:null,           // {sheetNames, activeSheet, headers, rows}
     wbMapping:emptyWbMapping(),
-    quote:null,             // {sheetNames, sheets:{name:{headers,rows}}}
+    quote:null,             // {sheetNames, sheets:{name:{headers,rows}}, _wb}
+    quoteTwoHeaderRows:false,
+    selectedSheets:[],
     planMode:'bySheet',     // 'bySheet' | 'byColumn'
     byColumnCol:'',
     plans:[],               // [{name, rows, headers, config}]
@@ -389,6 +431,7 @@ function defaultConfig(){
     base:{ weightCol:'', priceCol:'', extraCol:'', incKg:1, roundMethod:'ceil' },
     tier:{ lowCol:'', highCol:'', priceCol:'', priceType:'total' },
     hybrid:{ lowCol:'', highCol:'', priceCol:'', extraCol:'', incKg:1, roundMethod:'ceil' },
+    wideTier:{ tiers:[], openBaseCol:'', openExtraCol:'', incKg:1, roundMethod:'ceil' },
     post:{ discountPct:100, minCharge:'', roundMethod:'none', roundStep:'' },
     surcharges:[] };
 }
@@ -640,7 +683,11 @@ function renderQuoteModeArea(){
   const area = document.getElementById('quoteModeArea');
   if(!state.quote){ area.innerHTML=''; return; }
   area.innerHTML = `
-    <div class="field-row" style="margin-top:14px;">
+    <div class="field wide" style="margin-top:14px;">
+      <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="twoHeaderChk" ${state.quoteTwoHeaderRows?'checked':''} style="width:auto;"> 报价表表头占 2 行(自动合并表头,并自动去除表内重复表头行)</label>
+      <span class="hint">适用于"运费宝"等工具导出的、表头跨两行合并单元格的报价表(如按重量分列 + 面单费/续重单独一行的表头)</span>
+    </div>
+    <div class="field-row" style="margin-top:10px;">
       <div class="field wide">
         <label>报价方案的划分方式</label>
         <div class="radiogroup">
@@ -656,7 +703,14 @@ function renderQuoteModeArea(){
         <label for="byColumnCol">方案区分列</label>
         ${selectHtml('byColumnCol', state.quote.sheets[state._byColumnSheet||state.quote.sheetNames[0]].headers, state.byColumnCol, [{value:'',label:'请选择'}])}
       </div>` : ``}
-    </div>`;
+    </div>
+    ${state.planMode==='bySheet' ? `<div class="field wide" style="margin-top:10px;">
+      <label>选择哪些工作表作为报价方案(可多选;未勾选的会被跳过,例如历史版本、附加费规则等非核心报价表)</label>
+      <div style="display:flex; flex-wrap:wrap; gap:10px; margin-top:6px;">
+        ${state.quote.sheetNames.map(n=>`<label style="display:flex;align-items:center;gap:5px; font-size:13px; font-weight:400;"><input type="checkbox" class="sheetChk" value="${esc(n)}" ${state.selectedSheets.includes(n)?'checked':''} style="width:auto;"> ${esc(n)}</label>`).join('')}
+      </div>
+    </div>` : ``}`;
+  document.getElementById('twoHeaderChk').onchange = e=>{ state.quoteTwoHeaderRows = e.target.checked; reparseQuoteSheets(); renderAll(); };
   area.querySelectorAll('input[name=planMode]').forEach(r=>{
     r.onchange = e=>{ state.planMode = e.target.value; rebuildPlansFromQuote(); renderAll(); };
   });
@@ -666,6 +720,15 @@ function renderQuoteModeArea(){
     const colSel = document.getElementById('byColumnCol');
     if(colSel) colSel.onchange = e=>{ state.byColumnCol = e.target.value; rebuildPlansFromQuote(); renderAll(); };
   }
+  if(state.planMode==='bySheet'){
+    area.querySelectorAll('.sheetChk').forEach(cb=>{
+      cb.onchange = ()=>{
+        if(cb.checked){ if(!state.selectedSheets.includes(cb.value)) state.selectedSheets.push(cb.value); }
+        else { state.selectedSheets = state.selectedSheets.filter(x=>x!==cb.value); }
+        rebuildPlansFromQuote(); renderAll();
+      };
+    });
+  }
 }
 
 function rebuildPlansFromQuote(){
@@ -673,7 +736,8 @@ function rebuildPlansFromQuote(){
   const prevByName = {}; state.plans.forEach(p=>prevByName[p.name]=p.config);
   let plans = [];
   if(state.planMode==='bySheet'){
-    plans = state.quote.sheetNames.map(n=>({ name:n, headers:state.quote.sheets[n].headers, rows:state.quote.sheets[n].rows, config: prevByName[n] || defaultConfig() }));
+    const names = state.selectedSheets && state.selectedSheets.length ? state.selectedSheets : state.quote.sheetNames;
+    plans = names.map(n=>({ name:n, headers:state.quote.sheets[n].headers, rows:state.quote.sheets[n].rows, config: prevByName[n] || defaultConfig() }));
   } else {
     const sheetName = state._byColumnSheet || state.quote.sheetNames[0];
     const sheet = state.quote.sheets[sheetName];
@@ -727,6 +791,7 @@ function renderOnePlanCard(i){
           <label><input type="radio" name="mode_${i}" value="base" ${c.mode==='base'?'checked':''}> 首重 + 续重</label>
           <label><input type="radio" name="mode_${i}" value="tier" ${c.mode==='tier'?'checked':''}> 重量区间阶梯价</label>
           <label><input type="radio" name="mode_${i}" value="hybrid" ${c.mode==='hybrid'?'checked':''}> 阶梯价 + 续重(超出阶梯后按续重单价累加)</label>
+          <label><input type="radio" name="mode_${i}" value="wideTier" ${c.mode==='wideTier'?'checked':''}> 按重量分列的宽表(如运费宝导出格式)</label>
         </div>
       </div>
     </div>
@@ -885,7 +950,7 @@ function renderPlanModeFields(i){
     document.getElementById('th_'+i).onchange=e=>c.tier.highCol=e.target.value;
     document.getElementById('tp_'+i).onchange=e=>c.tier.priceCol=e.target.value;
     box.querySelectorAll(`input[name=ptype_${i}]`).forEach(r=>r.onchange=e=>c.tier.priceType=e.target.value);
-  } else {
+  } else if(c.mode==='hybrid'){
     box.innerHTML = `<p class="hint" style="margin:0 0 8px;">重量落在阶梯区间内时按阶梯价查表;超过最大阶梯上限后,以最高档阶梯价为基础,按续重单价逐段累加。</p>
     <div class="field-row">
       <div class="field"><label for="hl_${i}">重量下限列(可选)</label>${selectHtml('hl_'+i, h, c.hybrid.lowCol, [{value:'',label:'(无,视为0起)'}])}</div>
@@ -908,7 +973,63 @@ function renderPlanModeFields(i){
     document.getElementById('he_'+i).onchange=e=>c.hybrid.extraCol=e.target.value;
     document.getElementById('hi_'+i).oninput=e=>c.hybrid.incKg=parseFloat(e.target.value)||1;
     box.querySelectorAll(`input[name=hrnd_${i}]`).forEach(r=>r.onchange=e=>c.hybrid.roundMethod=e.target.value);
+  } else {
+    box.innerHTML = `<p class="hint" style="margin:0 0 8px;">每一列代表一个重量分界点的价格(如 0.5/1/2/3kg);超过最大分界点后,用"面单费+续重单价"续算。目的地列支持一格多填(空格分隔)、"【全部】"和"【排除】A B"写法。</p>
+    <div class="field-row">
+      <div class="field wide">
+        <label>阶梯价列(可多选;系统会尝试从列名读取重量,可手动修改)</label>
+        <div style="display:flex; gap:8px; margin-top:6px;">
+          ${selectHtml('wtAdd_'+i, h, '', [{value:'',label:'选择一列…'}])}
+          <button class="small" type="button" id="wtAddBtn_${i}">添加为阶梯列</button>
+        </div>
+        <div id="wtChips_${i}" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;"></div>
+      </div>
+    </div>
+    <div class="field-row" style="margin-top:10px;">
+      <div class="field"><label for="wtBase_${i}">面单费列(超出阶梯后的基础费)</label>${selectHtml('wtBase_'+i, h, c.wideTier.openBaseCol, [{value:'',label:'请选择'}])}</div>
+      <div class="field"><label for="wtExtra_${i}">续重单价列</label>${selectHtml('wtExtra_'+i, h, c.wideTier.openExtraCol, [{value:'',label:'请选择'}])}</div>
+      <div class="field"><label for="wtInc_${i}">续重进位(kg)</label><input type="number" id="wtInc_${i}" min="0.01" step="0.1" value="${c.wideTier.incKg}"></div>
+      <div class="field wide">
+        <label>续重取整方式</label>
+        <div class="radiogroup">
+          <label><input type="radio" name="wtrnd_${i}" value="ceil" ${c.wideTier.roundMethod==='ceil'?'checked':''}> 向上取整</label>
+          <label><input type="radio" name="wtrnd_${i}" value="floor" ${c.wideTier.roundMethod==='floor'?'checked':''}> 向下取整</label>
+          <label><input type="radio" name="wtrnd_${i}" value="round" ${c.wideTier.roundMethod==='round'?'checked':''}> 四舍五入</label>
+        </div>
+      </div>
+    </div>`;
+    document.getElementById('wtAddBtn_'+i).onclick = ()=>{
+      const sel = document.getElementById('wtAdd_'+i);
+      if(sel.value && !c.wideTier.tiers.some(t=>t.col===sel.value)){
+        const guess = parseFloat(sel.value);
+        c.wideTier.tiers.push({ col:sel.value, breakpoint: isNaN(guess)?0:guess });
+        renderWtChips(i);
+      }
+    };
+    document.getElementById('wtBase_'+i).onchange = e=>c.wideTier.openBaseCol=e.target.value;
+    document.getElementById('wtExtra_'+i).onchange = e=>c.wideTier.openExtraCol=e.target.value;
+    document.getElementById('wtInc_'+i).oninput = e=>c.wideTier.incKg=parseFloat(e.target.value)||1;
+    box.querySelectorAll(`input[name=wtrnd_${i}]`).forEach(r=>r.onchange=e=>c.wideTier.roundMethod=e.target.value);
+    renderWtChips(i);
   }
+}
+
+function renderWtChips(i){
+  const p = state.plans[i], c = p.config;
+  const box = document.getElementById('wtChips_'+i);
+  if(!box) return;
+  if(!c.wideTier.tiers.length){ box.innerHTML = '<span class="empty-note" style="padding:0;">尚未添加阶梯列。</span>'; return; }
+  box.innerHTML = c.wideTier.tiers.map((t,j)=>`
+    <span class="plan-tag" style="display:inline-flex; align-items:center; gap:6px; font-size:12.5px; padding:4px 6px 4px 10px;">
+      ${esc(t.col)} = <input type="number" step="0.1" data-j="${j}" value="${t.breakpoint}" style="width:64px; padding:2px 4px;"> kg
+      <button class="small" type="button" data-del="${j}" style="padding:1px 6px;">×</button>
+    </span>`).join('');
+  box.querySelectorAll('input[data-j]').forEach(inp=>{
+    inp.oninput = ()=>{ c.wideTier.tiers[parseInt(inp.dataset.j,10)].breakpoint = parseFloat(inp.value)||0; };
+  });
+  box.querySelectorAll('button[data-del]').forEach(btn=>{
+    btn.onclick = ()=>{ c.wideTier.tiers.splice(parseInt(btn.dataset.del,10),1); renderWtChips(i); };
+  });
 }
 
 function renderAssignArea(){
@@ -983,22 +1104,18 @@ function findQuoteRows(plan, targetProv, targetCity, targetCounty, shipDate){
   };
   let cands;
   if(countyCol && nq){
-    cands = rows.filter(r=> dateOk(r) && normalizeRegion(r[provCol])===np && cityCol && normalizeRegion(r[cityCol])===nc && r[countyCol] && normalizeRegion(r[countyCol])===nq);
+    cands = rows.filter(r=> dateOk(r) && destMatches(r[provCol],np) && cityCol && normalizeRegion(r[cityCol])===nc && r[countyCol] && normalizeRegion(r[countyCol])===nq);
     if(cands.length) return {rows:cands, level:'省+市+区县精确匹配'};
   }
-  cands = rows.filter(r=> dateOk(r) && normalizeRegion(r[provCol])===np && cityCol && r[cityCol] && normalizeRegion(r[cityCol])===nc && (!countyCol || !r[countyCol] || String(r[countyCol]).trim()===''));
+  cands = rows.filter(r=> dateOk(r) && destMatches(r[provCol],np) && cityCol && r[cityCol] && normalizeRegion(r[cityCol])===nc && (!countyCol || !r[countyCol] || String(r[countyCol]).trim()===''));
   if(cands.length) return {rows:cands, level:'省+市精确匹配'};
   if(cityCol){
-    cands = rows.filter(r=> dateOk(r) && normalizeRegion(r[provCol])===np && (!r[cityCol] || String(r[cityCol]).trim()===''));
+    cands = rows.filter(r=> dateOk(r) && destMatches(r[provCol],np) && (!r[cityCol] || String(r[cityCol]).trim()===''));
     if(cands.length) return {rows:cands, level:'全省统一价'};
   }
-  cands = rows.filter(r=> dateOk(r) && normalizeRegion(r[provCol])===np);
-  if(cands.length) return {rows:cands, level:'仅按省份匹配'};
-  if(np){
-    cands = rows.filter(r=> dateOk(r) && (()=>{ const rp=normalizeRegion(r[provCol]); return rp && (rp.includes(np)||np.includes(rp)); })());
-    if(cands.length) return {rows:cands, level:'省份模糊匹配'};
-  }
-  const anyIgnoringDate = rows.some(r=> normalizeRegion(r[provCol])===np);
+  cands = rows.filter(r=> dateOk(r) && destMatches(r[provCol],np));
+  if(cands.length) return {rows:cands, level:'按目的地匹配'};
+  const anyIgnoringDate = rows.some(r=> destMatches(r[provCol],np));
   if(anyIgnoringDate) return {rows:[], level:'该发货日期无生效报价'};
   return {rows:[], level:'未匹配'};
 }
@@ -1054,7 +1171,27 @@ function computeSurcharges(plan, ctx){
 
 function calcFeeForPlan(plan, candidateRows, conditionWeight, billingWeight){
   const cfg = plan.config;
-  if(cfg.mode==='hybrid'){
+  if(cfg.mode==='wideTier'){
+    const wt = cfg.wideTier;
+    if(!wt.tiers.length || !wt.openBaseCol || !wt.openExtraCol) return {error:'未完整设置宽表阶梯价字段'};
+    const r = candidateRows[0];
+    const warn = candidateRows.length>1 ? '同一目的地存在多条报价,已使用第一条' : null;
+    const sorted = [...wt.tiers].sort((a,b)=> a.breakpoint-b.breakpoint);
+    const maxTier = sorted[sorted.length-1];
+    if(conditionWeight <= maxTier.breakpoint+1e-9){
+      let hit = sorted.find(t=> conditionWeight <= t.breakpoint+1e-9);
+      if(!hit) hit = maxTier;
+      const price = parseFloat(r[hit.col])||0;
+      return {fee:+price.toFixed(2), warn, detailText:`阶梯价 ≤${hit.breakpoint}kg ¥${price}`};
+    }
+    const capPrice = parseFloat(r[wt.openBaseCol])||0;
+    const extraPrice = parseFloat(r[wt.openExtraCol])||0;
+    const inc = parseFloat(wt.incKg)||1;
+    const extraWeight = billingWeight-maxTier.breakpoint;
+    const units = roundUnits(extraWeight, inc, wt.roundMethod);
+    const fee = +(capPrice + units*extraPrice).toFixed(2);
+    return {fee, warn, detailText:`封顶价(${maxTier.breakpoint}kg)¥${capPrice} + 续重${inc}kg/¥${extraPrice}×${units}`};
+  } else if(cfg.mode==='hybrid'){
     const h = cfg.hybrid;
     if(!h.highCol || !h.priceCol || !h.extraCol) return {error:'未完整设置阶梯+续重字段'};
     const sorted = [...candidateRows].sort((a,b)=> parseFloat(a[h.highCol])-parseFloat(b[h.highCol]));
@@ -1282,6 +1419,17 @@ document.getElementById('waybillFile').addEventListener('change', async e=>{
   }catch(err){ alert('运单表读取失败,请确认文件格式。'); }
 });
 
+const AUX_SHEET_HINTS = ['（旧）','(旧)','加收费用','免收比率','单量要求','均重费用','全局设置'];
+
+function reparseQuoteSheets(){
+  if(!state.quote || !state.quote._wb) return;
+  const wb = state.quote._wb;
+  const sheets = {};
+  wb.SheetNames.forEach(n=>{ sheets[n] = state.quoteTwoHeaderRows ? sheetToRowsMultiHeader(wb.Sheets[n]) : sheetToRows(wb.Sheets[n]); });
+  state.quote.sheets = sheets;
+  rebuildPlansFromQuote();
+}
+
 document.getElementById('quoteFile').addEventListener('change', async e=>{
   const file = e.target.files[0]; if(!file) return;
   try{
@@ -1290,7 +1438,10 @@ document.getElementById('quoteFile').addEventListener('change', async e=>{
     wb.SheetNames.forEach(n=>{ sheets[n] = sheetToRows(wb.Sheets[n]); });
     state.isSample = false;
     document.getElementById('sampleBanner').hidden = true;
-    state.quote = { sheetNames: wb.SheetNames, sheets };
+    state.quote = { sheetNames: wb.SheetNames, sheets, _wb: wb };
+    state.quoteTwoHeaderRows = false;
+    state.selectedSheets = wb.SheetNames.filter(n=> !AUX_SHEET_HINTS.some(h=>n.includes(h)));
+    if(!state.selectedSheets.length) state.selectedSheets = [...wb.SheetNames];
     state.planMode = 'bySheet';
     state._byColumnSheet = wb.SheetNames[0];
     state.byColumnCol = '';

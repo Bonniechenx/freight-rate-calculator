@@ -170,6 +170,22 @@
     <button class="ghost small" id="clearSampleBtn">清空示例,上传我的数据</button>
   </div>
 
+  <div class="card" id="quickCalcCard" style="margin-bottom:26px;">
+    <strong style="font-size:14.5px;">快速核对一票运费</strong>
+    <p class="hint" style="margin-top:2px;">不用先上传运单表,直接输入目的地和重量,用当前已配置好的报价方案试算一票。</p>
+    <div class="field-row" style="margin-top:12px;">
+      <div class="field wide"><label for="qcDest">目的地(省市区,如:广东省深圳市南山区)</label><input type="text" id="qcDest" placeholder="广东省深圳市"></div>
+      <div class="field"><label for="qcWeight">计费重量(kg)</label><input type="number" id="qcWeight" min="0" step="0.01" placeholder="如 2.5"></div>
+    </div>
+    <div class="field-row" style="margin-top:10px;">
+      <div class="field"><label for="qcPlan">报价方案</label><select id="qcPlan"></select></div>
+      <div class="field"><label for="qcShop">店铺(可选,命中绑定关系会自动换用对应报价)</label><input type="text" id="qcShop" placeholder="如:森屿旗舰店"></div>
+      <div class="field"><label for="qcDate">发货日期(可选)</label><input type="date" id="qcDate"></div>
+      <div style="align-self:flex-end;"><button class="primary" type="button" id="qcBtn">试算</button></div>
+    </div>
+    <div id="qcResult" style="margin-top:14px;"></div>
+  </div>
+
   <div class="stepstack">
 
     <section class="step active" data-step="1" id="step1">
@@ -212,6 +228,7 @@
       <div class="step-num">3</div>
       <h2>报价方案对照</h2>
       <p class="sub" id="step3sub">将运单表中"报价方案选择列"的每个取值,对应到具体的报价方案。</p>
+      <div id="bindingArea"></div>
       <div class="card" id="assignArea"></div>
     </section>
 
@@ -405,10 +422,25 @@ const SAMPLE_PLAN_ECONOMY = [
 /* ---------------- state ---------------- */
 let state = null;
 function emptyWbMapping(){
-  return { no:'',province:'',city:'',county:'',date:'', planKeyCols:[],
+  return { no:'',province:'',city:'',county:'',date:'', shop:'', planKeyCols:[],
     weightMode:'direct', weight:'', actualCol:'', volSource:'lwh',
     lenCol:'',widthCol:'',heightCol:'',volDivisor:6000, volCol:'',
     dualWeight:false, conditionBasis:'actual', billingBasis:'max' };
+}
+
+/* ---------------- shop/customer binding (persisted locally) ---------------- */
+const BINDINGS_KEY = 'freightcalc_shop_bindings_v1';
+function loadBindings(){
+  try{ const raw = localStorage.getItem(BINDINGS_KEY); return raw ? JSON.parse(raw) : []; }catch(e){ return []; }
+}
+function saveBindings(){
+  try{ localStorage.setItem(BINDINGS_KEY, JSON.stringify(shopBindings)); }catch(e){}
+}
+let shopBindings = loadBindings();
+function resolveBinding(shopRaw){
+  const shop = String(shopRaw==null?'':shopRaw).trim();
+  if(!shop) return null;
+  return shopBindings.find(b=> b.shop && b.shop.trim()===shop) || null;
 }
 function emptyState(){
   return {
@@ -498,9 +530,171 @@ function renderAll(){
   renderWaybillPreview();
   renderQuoteModeArea();
   renderPlanCards();
+  renderBindingArea();
   renderAssignArea();
   updateLocksAndCalcButton();
+  renderQuickCalc();
   if(state.results){ renderResults(); } else { document.getElementById('resultsSection').hidden = true; }
+}
+
+function renderQuickCalc(){
+  const sel = document.getElementById('qcPlan');
+  if(!sel) return;
+  const names = state.plans.map(p=>p.name);
+  const cur = sel.value;
+  sel.innerHTML = names.length
+    ? names.map(n=>`<option value="${esc(n)}"${n===cur?' selected':''}>${esc(n)}</option>`).join('')
+    : '<option value="">(暂无可用方案,请先完成第 2 步)</option>';
+}
+
+function quickCalc({province, city, county, weight, planName, shipDate, shop}){
+  if(shop){
+    const b = resolveBinding(shop);
+    if(b) planName = b.plan;
+  }
+  const plan = state.plans.find(p=>p.name===planName);
+  if(isNaN(weight) || weight==null) return {status:'error', note:'请输入有效的计费重量', fee:null, detail:''};
+  if(!plan) return {status:'error', note:'未找到对应报价方案,请先在第 2 步配置报价', fee:null, detail:''};
+  const match = findQuoteRows(plan, province, city, county, shipDate);
+  if(!match.rows.length) return {status:'error', note: match.level==='该发货日期无生效报价' ? match.level : '报价表中无匹配的省份/城市/区县', fee:null, detail:''};
+  const calc = calcFeeForPlan(plan, match.rows, weight, weight);
+  if(calc.error) return {status:'error', note:calc.error, fee:null, detail:match.level};
+  let fee = calc.fee;
+  const notes = [];
+  const post = plan.config.post;
+  const discountPct = post.discountPct==='' || post.discountPct==null ? 100 : parseFloat(post.discountPct);
+  if(!isNaN(discountPct) && discountPct!==100){ fee = fee*(discountPct/100); notes.push(`折扣${discountPct}%`); }
+  const minCharge = post.minCharge==='' || post.minCharge==null ? null : parseFloat(post.minCharge);
+  if(minCharge!=null && !isNaN(minCharge) && fee<minCharge){ fee = minCharge; notes.push(`按最低收费¥${minCharge}`); }
+  fee = applyAmountRounding(fee, post.roundMethod, post.roundStep);
+  const sc = computeSurcharges(plan, { province, billingWeight:weight, shipDate });
+  let prepaid = 0;
+  if(shop){ const b = resolveBinding(shop); if(b) prepaid = parseFloat(b.prepaid)||0; }
+  const total = +(fee + sc.total - prepaid).toFixed(2);
+  const detailParts = [calc.detailText];
+  if(notes.length) detailParts.push(notes.join('; '));
+  if(sc.text) detailParts.push(`附加费:${sc.text}`);
+  if(prepaid) detailParts.push(`预付面单费抵扣 -¥${prepaid}`);
+  return { status: calc.warn ? 'warn' : 'ok', note: calc.warn || match.level, fee: total, detail: detailParts.filter(Boolean).join(' · ') };
+}
+
+function renderQuickCalcResult(r){
+  const box = document.getElementById('qcResult');
+  if(!box) return;
+  if(!r){ box.innerHTML = ''; return; }
+  const chipClass = r.status==='ok' ? 'ok' : r.status==='warn' ? 'warn' : 'error';
+  const chipLabel = r.status==='ok' ? '已匹配' : r.status==='warn' ? '警告' : '异常';
+  box.innerHTML = `<div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; padding:14px 16px; border-radius:var(--radius); background:var(--accent-soft); border:1px solid var(--line);">
+    <div class="mono" style="font-size:26px; font-weight:700;">${r.fee==null?'—':'¥'+fmtMoney(r.fee)}</div>
+    <span class="chip ${chipClass}">${chipLabel}</span>
+    <div style="flex:1; min-width:200px; font-size:13px; color:var(--muted);">${esc(r.note||'')}${r.detail?' · '+esc(r.detail):''}</div>
+  </div>`;
+}
+
+function renderBindingArea(){
+  const box = document.getElementById('bindingArea');
+  if(!box) return;
+  const m = state.wbMapping;
+  const planNames = state.plans.map(p=>p.name);
+  const shopFieldHtml = state.waybill
+    ? selectHtml('map_shop', state.waybill.headers, m.shop, [{value:'',label:'(不使用店铺绑定)'}])
+    : '<select disabled><option>请先上传运单表</option></select>';
+  box.innerHTML = `<div class="card" style="margin-bottom:12px;">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+      <div>
+        <label style="font-size:13.5px; font-weight:700;">客户 / 店铺绑定关系(可选,长期复用)</label>
+        <p class="hint" style="margin-top:2px; max-width:56ch;">维护"店铺→所属客户→所用报价方案→预付面单费"的固定对照,保存在本机浏览器;以后每次上传新运单,只要有店铺列,就会自动按店铺名匹配方案并扣减预付面单费,不用重新设置。</p>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="ghost small" type="button" id="downloadBindingTplBtn">下载/导出绑定表</button>
+        <label class="ghost small" style="display:inline-flex;align-items:center;cursor:pointer; padding:5px 10px; border:1px solid var(--line); border-radius:8px; font-weight:600; font-size:12px;">
+          导入绑定表<input type="file" id="bindingFile" accept=".xlsx,.xls,.csv" style="display:none;">
+        </label>
+      </div>
+    </div>
+    <div class="field-row" style="margin-top:12px;">
+      <div class="field"><label for="map_shop">运单表店铺列</label>${shopFieldHtml}</div>
+    </div>
+    <div class="field-row" style="margin-top:12px;">
+      <div class="field"><label for="bindShop">店铺名称</label><input type="text" id="bindShop" placeholder="如:森屿旗舰店"></div>
+      <div class="field"><label for="bindCustomer">所属客户</label><input type="text" id="bindCustomer" placeholder="如:森屿电商"></div>
+      <div class="field"><label for="bindPlan">所用报价方案</label>${selectHtml('bindPlan', planNames, planNames[0]||'', planNames.length?[]:[{value:'',label:'(暂无可用方案)'}])}</div>
+      <div class="field"><label for="bindPrepaid">预付面单费(元)</label><input type="number" id="bindPrepaid" value="0" step="0.1"></div>
+      <div style="align-self:flex-end;"><button class="small" type="button" id="addBindingBtn">添加绑定</button></div>
+    </div>
+    <div id="bindingList" style="margin-top:12px;"></div>
+  </div>`;
+  if(state.waybill){
+    document.getElementById('map_shop').onchange = e=>{ m.shop = e.target.value; };
+  }
+  document.getElementById('downloadBindingTplBtn').onclick = downloadBindingTemplate;
+  document.getElementById('bindingFile').addEventListener('change', handleBindingFileUpload);
+  document.getElementById('addBindingBtn').onclick = ()=>{
+    const shop = document.getElementById('bindShop').value.trim();
+    const customer = document.getElementById('bindCustomer').value.trim();
+    const plan = document.getElementById('bindPlan').value;
+    const prepaid = parseFloat(document.getElementById('bindPrepaid').value)||0;
+    if(!shop){ alert('请填写店铺名称。'); return; }
+    shopBindings = shopBindings.filter(b=>b.shop!==shop);
+    shopBindings.push({ shop, customer, plan, prepaid });
+    saveBindings();
+    renderBindingList();
+    document.getElementById('bindShop').value=''; document.getElementById('bindCustomer').value=''; document.getElementById('bindPrepaid').value='0';
+  };
+  renderBindingList();
+}
+
+function renderBindingList(){
+  const box = document.getElementById('bindingList');
+  if(!box) return;
+  if(!shopBindings.length){ box.innerHTML = '<p class="empty-note">尚未配置绑定关系。</p>'; return; }
+  box.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>店铺名称</th><th>所属客户</th><th>所用报价方案</th><th class="num">预付面单费</th><th></th></tr></thead>
+    <tbody>${shopBindings.map((b,idx)=>`<tr>
+      <td>${esc(b.shop)}</td><td>${esc(b.customer)}</td><td>${esc(b.plan)}</td><td class="num">${fmtMoney(b.prepaid)}</td>
+      <td><button class="small ghost" type="button" data-del="${idx}">删除</button></td>
+    </tr>`).join('')}</tbody></table></div>`;
+  box.querySelectorAll('button[data-del]').forEach(btn=>{
+    btn.onclick = ()=>{ shopBindings.splice(parseInt(btn.dataset.del,10),1); saveBindings(); renderBindingList(); };
+  });
+}
+
+async function downloadBindingTemplate(){
+  const header = ['店铺名称','所属客户','所用报价方案','预付面单费'];
+  const dataRows = shopBindings.length
+    ? shopBindings.map(b=>[b.shop,b.customer,b.plan,b.prepaid])
+    : [['森屿旗舰店','森屿电商', state.plans[0]?state.plans[0].name:'默认报价', 0]];
+  const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '绑定关系');
+  const buf = XLSX.write(wb, {type:'array', bookType:'xlsx'});
+  const blob = new Blob([buf], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const res = await offerFileDownload('店铺绑定关系模板.xlsx', blob);
+  if(!res.ok && res.reason!=='declined') alert('下载失败,请重试,或直接复制上方表格另存。');
+}
+
+async function handleBindingFileUpload(e){
+  const file = e.target.files[0]; if(!file) return;
+  try{
+    const wb = await readWorkbook(file);
+    const {rows} = sheetToRows(wb.Sheets[wb.SheetNames[0]]);
+    const pick = (row, names)=>{ for(const n of names){ if(row[n]!=null && row[n]!=='') return row[n]; } return ''; };
+    let added = 0;
+    rows.forEach(r=>{
+      const shop = String(pick(r, ['店铺名称','店铺'])).trim();
+      if(!shop) return;
+      const customer = String(pick(r, ['所属客户','客户名称','客户'])).trim();
+      const plan = String(pick(r, ['所用报价方案','所用报价','报价名称','报价方案'])).trim();
+      const prepaid = parseFloat(pick(r, ['预付面单费','预付费','面单费'])) || 0;
+      shopBindings = shopBindings.filter(b=>b.shop!==shop);
+      shopBindings.push({ shop, customer, plan, prepaid });
+      added++;
+    });
+    saveBindings();
+    renderBindingList();
+    alert(`已导入 ${added} 条绑定关系。`);
+  }catch(err){ alert('绑定关系文件读取失败,请确认文件格式。'); }
+  e.target.value = '';
 }
 
 function renderWaybillSheetSelector(){
@@ -1289,7 +1483,13 @@ function computeAll(){
     }
     const wres = resolveWeights(row, m);
     const shipDate = m.date ? parseAnyDate(row[m.date]) : null;
-    const planName = usePlanKey ? state.planAssignment[planKeyOf(row)] : state.singlePlanForAll;
+    let planName = usePlanKey ? state.planAssignment[planKeyOf(row)] : state.singlePlanForAll;
+    let prepaid = 0, bindingNote = '';
+    if(m.shop){
+      const binding = resolveBinding(row[m.shop]);
+      if(binding){ planName = binding.plan; prepaid = parseFloat(binding.prepaid)||0; bindingNote = `店铺绑定:${binding.shop}→${binding.plan}`; }
+      else { bindingNote = String(row[m.shop]||'').trim() ? '该店铺未在绑定关系中配置,按其他设置匹配方案' : ''; }
+    }
     const plan = state.plans.find(p=>p.name===planName);
     const base = { no, province:provRaw, city:cityRaw, weight: wres.billingWeight, planName: planName||'' };
     if(isNaN(wres.billingWeight) || isNaN(wres.conditionWeight)) return Object.assign({}, base, {status:'error', note:'计费重量无效', fee:null, detail:''});
@@ -1309,12 +1509,14 @@ function computeAll(){
     fee = applyAmountRounding(fee, post.roundMethod, post.roundStep);
 
     const sc = computeSurcharges(plan, { province:provForMatch, billingWeight:wres.billingWeight, shipDate });
-    const total = +(fee + sc.total).toFixed(2);
+    const total = +(fee + sc.total - prepaid).toFixed(2);
 
     const detailParts = [calc.detailText];
     if(wres.note) detailParts.push(wres.note);
     if(notes.length) detailParts.push(notes.join('; '));
     if(sc.text) detailParts.push(`附加费:${sc.text}`);
+    if(bindingNote) detailParts.push(bindingNote);
+    if(prepaid) detailParts.push(`预付面单费抵扣 -¥${prepaid}`);
 
     return Object.assign({}, base, {
       status: calc.warn ? 'warn' : 'ok',
@@ -1359,6 +1561,23 @@ let downloadsApi = null;
   try{ if(window.claude && window.claude.use) downloadsApi = await window.claude.use('downloads'); }catch(e){ downloadsApi = null; }
 })();
 
+async function offerFileDownload(filename, blob){
+  const inClaudeFrame = !!(window.claude && window.claude.use);
+  if(inClaudeFrame){
+    if(!downloadsApi){ try{ downloadsApi = await window.claude.use('downloads'); }catch(e){} }
+    if(!downloadsApi) return {ok:false, reason:'unavailable'};
+    try{ await downloadsApi.save({ filename, data: blob }); return {ok:true}; }
+    catch(err){ return {ok:false, reason: (err && err.code) || 'unknown'}; }
+  }
+  try{
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+    setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+    return {ok:true};
+  }catch(err){ return {ok:false, reason:'error'}; }
+}
+
 async function exportResults(){
   const msg = document.getElementById('exportMsg');
   msg.innerHTML = '';
@@ -1373,33 +1592,11 @@ async function exportResults(){
   XLSX.utils.book_append_sheet(wb, ws, '计费结果');
   const buf = XLSX.write(wb, {type:'array', bookType:'xlsx'});
   const blob = new Blob([buf], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-  const filename = '运费核算结果.xlsx';
-  const inClaudeFrame = !!(window.claude && window.claude.use);
-  if(inClaudeFrame){
-    if(!downloadsApi){
-      try{ downloadsApi = await window.claude.use('downloads'); }catch(e){}
-    }
-    if(!downloadsApi){
-      msg.innerHTML = '<div class="msg warn">当前环境不支持直接下载文件,请把本工具保存为独立网页文件后在浏览器中打开,或直接复制上方表格数据。</div>';
-      return;
-    }
-    try{
-      await downloadsApi.save({ filename, data: blob });
-    }catch(err){
-      const code = err && err.code;
-      if(code==='declined') return;
-      msg.innerHTML = `<div class="msg error">导出失败(${esc(code||'未知错误')}),请重试。</div>`;
-    }
-    return;
-  }
-  // standalone页面(独立网页文件,非 Claude 内嵌环境):走浏览器原生下载
-  try{
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
-    setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
-  }catch(err){
-    msg.innerHTML = '<div class="msg error">导出失败,请重试。</div>';
+  const res = await offerFileDownload('运费核算结果.xlsx', blob);
+  if(!res.ok){
+    if(res.reason==='declined') return;
+    if(res.reason==='unavailable') msg.innerHTML = '<div class="msg warn">当前环境不支持直接下载文件,请把本工具保存为独立网页文件后在浏览器中打开,或直接复制上方表格数据。</div>';
+    else msg.innerHTML = `<div class="msg error">导出失败(${esc(res.reason)}),请重试。</div>`;
   }
 }
 
@@ -1454,6 +1651,17 @@ document.getElementById('quoteFile').addEventListener('change', async e=>{
 document.getElementById('calcBtn').addEventListener('click', computeAll);
 document.getElementById('exportBtn').addEventListener('click', exportResults);
 document.getElementById('clearSampleBtn').addEventListener('click', resetAll);
+document.getElementById('qcBtn').addEventListener('click', ()=>{
+  const destRaw = document.getElementById('qcDest').value.trim();
+  const weight = parseWeight(document.getElementById('qcWeight').value);
+  const planName = document.getElementById('qcPlan').value;
+  const shop = document.getElementById('qcShop').value.trim();
+  const shipDate = document.getElementById('qcDate').value || null;
+  if(!destRaw){ renderQuickCalcResult({status:'error', note:'请输入目的地', fee:null, detail:''}); return; }
+  const addr = extractAddressParts(destRaw);
+  const r = quickCalc({ province:addr.province, city:addr.city, county:addr.county, weight, planName, shipDate, shop });
+  renderQuickCalcResult(r);
+});
 
 /* ---------------- boot ---------------- */
 initSample();

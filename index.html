@@ -461,7 +461,7 @@ function emptyState(){
 function defaultConfig(){
   return { provinceCol:'', cityCol:'', countyCol:'', dateFromCol:'', dateToCol:'', mode:'base',
     base:{ weightCol:'', priceCol:'', extraCol:'', incKg:1, roundMethod:'ceil' },
-    tier:{ lowCol:'', highCol:'', priceCol:'', priceType:'total' },
+    tier:{ lowCol:'', highCol:'', priceCol:'', priceType:'total', cumulative:false },
     hybrid:{ lowCol:'', highCol:'', priceCol:'', extraCol:'', incKg:1, roundMethod:'ceil' },
     wideTier:{ tiers:[], openBaseCol:'', openExtraCol:'', incKg:1, roundMethod:'ceil' },
     post:{ discountPct:100, minCharge:'', roundMethod:'none', roundStep:'' },
@@ -1136,14 +1136,20 @@ function renderPlanModeFields(i){
         <label>价格类型</label>
         <div class="radiogroup">
           <label><input type="radio" name="ptype_${i}" value="total" ${c.tier.priceType==='total'?'checked':''}> 该区间总价</label>
-          <label><input type="radio" name="ptype_${i}" value="unit" ${c.tier.priceType==='unit'?'checked':''}> 单价(需×重量)</label>
+          <label><input type="radio" name="ptype_${i}" value="unit" ${c.tier.priceType==='unit'?'checked':''}> 单价(元/kg)</label>
         </div>
       </div>
+      ${c.tier.priceType==='unit' ? `<div class="field wide">
+        <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="tcum_${i}" ${c.tier.cumulative?'checked':''} style="width:auto;"> 阶梯式(跨档位累进计费,而非整票按命中的一档单价收费)</label>
+        <span class="hint">例如 150kg 命中 0-50/50-100/100-150 三档单价 1.5/1.8/2 元:阶梯式 = 50×1.5+50×1.8+50×2=265元;不开启则整票按 150kg 所在档单价计算=150×2=300元</span>
+      </div>` : ``}
     </div>`;
     document.getElementById('tl_'+i).onchange=e=>c.tier.lowCol=e.target.value;
     document.getElementById('th_'+i).onchange=e=>c.tier.highCol=e.target.value;
     document.getElementById('tp_'+i).onchange=e=>c.tier.priceCol=e.target.value;
-    box.querySelectorAll(`input[name=ptype_${i}]`).forEach(r=>r.onchange=e=>c.tier.priceType=e.target.value);
+    box.querySelectorAll(`input[name=ptype_${i}]`).forEach(r=>r.onchange=e=>{ c.tier.priceType=e.target.value; renderPlanModeFields(i); });
+    const tcum = document.getElementById('tcum_'+i);
+    if(tcum) tcum.onchange = e=>c.tier.cumulative=e.target.checked;
   } else if(c.mode==='hybrid'){
     box.innerHTML = `<p class="hint" style="margin:0 0 8px;">重量落在阶梯区间内时按阶梯价查表;超过最大阶梯上限后,以最高档阶梯价为基础,按续重单价逐段累加。</p>
     <div class="field-row">
@@ -1425,6 +1431,26 @@ function calcFeeForPlan(plan, candidateRows, conditionWeight, billingWeight){
     const cfg2 = cfg.tier;
     if(!cfg2.highCol || !cfg2.priceCol) return {error:'未完整设置区间价字段'};
     const sorted = [...candidateRows].sort((a,b)=> parseFloat(a[cfg2.highCol])-parseFloat(b[cfg2.highCol]));
+    if(cfg2.priceType==='unit' && cfg2.cumulative){
+      let prevHigh = 0, fee = 0;
+      for(const r of sorted){
+        const high = parseFloat(r[cfg2.highCol]);
+        const low = cfg2.lowCol ? parseFloat(r[cfg2.lowCol]) : prevHigh;
+        const bandLow = Math.max(low, prevHigh);
+        if(billingWeight <= bandLow + 1e-9){ prevHigh = high; continue; }
+        const bandHigh = Math.min(high, billingWeight);
+        const span = bandHigh - bandLow;
+        if(span>0) fee += span * (parseFloat(r[cfg2.priceCol])||0);
+        prevHigh = high;
+        if(billingWeight <= high+1e-9) break;
+      }
+      let warn = null;
+      if(prevHigh < billingWeight - 1e-9){
+        warn = '超出报价重量区间,已按最高档单价估算超出部分,请人工核实';
+        fee += (billingWeight-prevHigh) * (parseFloat(sorted[sorted.length-1][cfg2.priceCol])||0);
+      }
+      return {fee:+fee.toFixed(2), warn, detailText:`阶梯式累进 0~${billingWeight}kg,合计¥${fee.toFixed(2)}`};
+    }
     let hit = null;
     for(const r of sorted){
       const high = parseFloat(r[cfg2.highCol]);
